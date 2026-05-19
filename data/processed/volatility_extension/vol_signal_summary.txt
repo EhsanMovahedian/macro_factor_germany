@@ -1,0 +1,24 @@
+US signal: F1 from original Fhat64.mat (sample restricted to 1964-01 to 2003-12).
+DE signal: F1 from germany replication factors.csv (available trimmed sample).
+Vol proxies: squared monthly 10Y yield change, GARCH(1,1) variance of monthly 10Y change; US also VIX monthly mean.
+
+Correlations
+            metric  nobs  corr_contemp  corr_lag_vol
+   US corr(F1, sq)   480      0.306140      0.261291
+US corr(F1, garch)   480      0.316347      0.281534
+  US corr(F1, VIX)   168      0.223804      0.283931
+   DE corr(F1, sq)   211      0.065234      0.128152
+DE corr(F1, garch)   211      0.259028      0.258476
+
+HAC OLS (signal on volatility proxy)
+                       spec  nobs      beta        t            p       r2
+    US: F1 ~ sq(y10 change)   480  1.223554 4.986162 6.159036e-07 0.093722
+    US: F1 ~ garch var(y10)   480  2.600069 3.116352 1.831033e-03 0.100075
+US: F1 ~ VIX (monthly mean)   168  0.024787 1.747230 8.059747e-02 0.050088
+    DE: F1 ~ sq(y10 change)   211  1.525234 0.659156 5.097956e-01 0.004255
+    DE: F1 ~ garch var(y10)   211 18.661800 1.472668 1.408407e-01 0.067095
+US: F1 ~ lag sq(y10 change)   480  1.044301 5.545693 2.927919e-08 0.068273
+US: F1 ~ lag garch var(y10)   480  2.312642 2.629168 8.559404e-03 0.079261
+           US: F1 ~ lag VIX   167  0.031472 2.221870 2.629212e-02 0.080617
+DE: F1 ~ lag sq(y10 change)   211  3.041700 1.055045 2.914046e-01 0.016423
+DE: F1 ~ lag garch var(y10)   211 19.620495 1.643025 1.003778e-01 0.066810
