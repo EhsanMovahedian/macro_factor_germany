@@ -9,30 +9,26 @@ import statsmodels.api as sm
 from arch import arch_model
 from scipy.stats import kendalltau, spearmanr
 
+import investpy
 
-def fred_series(series_id: str) -> pd.Series:
+
+def fred_series(series_id: str, how: str = "last") -> pd.Series:
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     df = pd.read_csv(url)
     df.columns = ["date", series_id]
     df["date"] = pd.to_datetime(df["date"])
     df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
-    return df.set_index("date")[series_id].dropna().sort_index().resample("ME").last()
+    s = df.set_index("date")[series_id].dropna().sort_index()
+    return s.resample("ME").mean() if how == "mean" else s.resample("ME").last()
 
 
-def hac_ols(y: pd.Series, x: pd.Series, label: str) -> dict[str, float | int | str]:
+def hac_ols(y: pd.Series, x: pd.Series) -> tuple[int, float, float, float, float]:
     d = pd.concat([y.rename("y"), x.rename("x")], axis=1, join="inner").dropna()
     if len(d) < 40:
-        return {"spec": label, "nobs": len(d), "beta": np.nan, "t": np.nan, "p": np.nan, "r2": np.nan}
+        return len(d), np.nan, np.nan, np.nan, np.nan
     X = sm.add_constant(d["x"])
     m = sm.OLS(d["y"], X).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
-    return {
-        "spec": label,
-        "nobs": int(m.nobs),
-        "beta": float(m.params["x"]),
-        "t": float(m.tvalues["x"]),
-        "p": float(m.pvalues["x"]),
-        "r2": float(m.rsquared),
-    }
+    return int(m.nobs), float(m.params["x"]), float(m.tvalues["x"]), float(m.pvalues["x"]), float(m.rsquared)
 
 
 def main() -> None:
@@ -40,80 +36,118 @@ def main() -> None:
     out = root / "data" / "processed" / "volatility_extension"
     out.mkdir(parents=True, exist_ok=True)
 
-    us_mat = sio.loadmat(root / "data" / "input" / "lndata.mat")
-    # Original US factor file is external in most setups; expected under data/input/Fhat64.mat if present.
+    # US factors (F1..F5) from original replication file
     fhat_path = root / "data" / "input" / "Fhat64.mat"
     if not fhat_path.exists():
-        raise FileNotFoundError("Expected data/input/Fhat64.mat for US signal")
-    fhat = sio.loadmat(fhat_path)["Fhat_T"]
-    us_dates = pd.date_range("1964-01-31", periods=fhat.shape[0], freq="ME")
-    us_signal = pd.Series(fhat[:, 0], index=us_dates, name="US_F1").loc["1964-01-31":"2003-12-31"]
+        raise FileNotFoundError("Expected data/input/Fhat64.mat for US factors")
+    us_fhat = sio.loadmat(fhat_path)["Fhat_T"]
+    us_dates = pd.date_range("1964-01-31", periods=us_fhat.shape[0], freq="ME")
+    us_fac = pd.DataFrame(us_fhat[:, :5], index=us_dates, columns=[f"F{i}" for i in range(1, 6)])
+    us_fac = us_fac.loc["1964-01-31":"2003-12-31"]
 
-    de_factors = pd.read_csv(root / "data" / "processed" / "replication" / "factors.csv", parse_dates=["date"]).set_index("date").sort_index()
-    de_signal = de_factors["F1"].rename("DE_F1")
-    de_signal.index = de_signal.index.to_period("M").to_timestamp("M")
+    # Germany factors (F1..F5)
+    de_fac = pd.read_csv(
+        root / "data" / "processed" / "replication" / "factors.csv", parse_dates=["date"]
+    ).set_index("date").sort_index()
+    de_fac = de_fac[[f"F{i}" for i in range(1, 6)]].copy()
+    de_fac.index = de_fac.index.to_period("M").to_timestamp("M")
 
-    us10 = fred_series("GS10")
-    de10 = fred_series("IRLTLT01DEM156N")
+    # Vol proxies from rates
+    us10 = fred_series("GS10", "last")
+    de10 = fred_series("IRLTLT01DEM156N", "last")
     us_sq = (us10.diff() ** 2).rename("us_sq")
     de_sq = (de10.diff() ** 2).rename("de_sq")
 
-    am_us = arch_model(us10.diff().dropna() * 100, mean="Zero", vol="GARCH", p=1, q=1)
-    us_fit = am_us.fit(disp="off")
-    us_garch = ((us_fit.conditional_volatility / 100.0) ** 2).rename("us_garch")
+    us_garch = (
+        (arch_model(us10.diff().dropna() * 100, mean="Zero", vol="GARCH", p=1, q=1).fit(disp="off").conditional_volatility / 100.0)
+        ** 2
+    ).rename("us_garch")
+    de_garch = (
+        (arch_model(de10.diff().dropna() * 100, mean="Zero", vol="GARCH", p=1, q=1).fit(disp="off").conditional_volatility / 100.0)
+        ** 2
+    ).rename("de_garch")
 
-    am_de = arch_model(de10.diff().dropna() * 100, mean="Zero", vol="GARCH", p=1, q=1)
-    de_fit = am_de.fit(disp="off")
-    de_garch = ((de_fit.conditional_volatility / 100.0) ** 2).rename("de_garch")
+    # US implied vol
+    us_vix = fred_series("VIXCLS", "mean").rename("us_vix")
 
-    vix = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS")
-    vix.columns = ["date", "VIXCLS"]
-    vix["date"] = pd.to_datetime(vix["date"])
-    vix["VIXCLS"] = pd.to_numeric(vix["VIXCLS"], errors="coerce")
-    us_vix = vix.set_index("date")["VIXCLS"].dropna().sort_index().resample("ME").mean().rename("us_vix")
+    # Germany / Euro implied vol proxies
+    vdax_daily = investpy.get_index_historical_data(
+        index="VDAX New", country="germany", from_date="01/01/2000", to_date="31/12/2022"
+    )
+    vdax = vdax_daily["Close"].astype(float)
+    vdax.index = pd.to_datetime(vdax.index)
+    vdax = vdax.resample("ME").mean().rename("de_vdax")
 
-    rows = [
-        hac_ols(us_signal, us_sq, "US: F1 ~ sq(y10 change)"),
-        hac_ols(us_signal, us_garch, "US: F1 ~ garch var(y10)"),
-        hac_ols(us_signal, us_vix, "US: F1 ~ VIX (monthly mean)"),
-        hac_ols(de_signal, de_sq, "DE: F1 ~ sq(y10 change)"),
-        hac_ols(de_signal, de_garch, "DE: F1 ~ garch var(y10)"),
-        hac_ols(us_signal, us_sq.shift(1), "US: F1 ~ lag sq(y10 change)"),
-        hac_ols(us_signal, us_garch.shift(1), "US: F1 ~ lag garch var(y10)"),
-        hac_ols(us_signal, us_vix.shift(1), "US: F1 ~ lag VIX"),
-        hac_ols(de_signal, de_sq.shift(1), "DE: F1 ~ lag sq(y10 change)"),
-        hac_ols(de_signal, de_garch.shift(1), "DE: F1 ~ lag garch var(y10)"),
-    ]
-    reg = pd.DataFrame(rows)
+    vstoxx_daily = investpy.get_index_historical_data(
+        index="STOXX 50 Volatility VSTOXX EUR",
+        country="euro zone",
+        from_date="01/01/2000",
+        to_date="31/12/2022",
+    )
+    vstoxx = vstoxx_daily["Close"].astype(float)
+    vstoxx.index = pd.to_datetime(vstoxx.index)
+    vstoxx = vstoxx.resample("ME").mean().rename("de_vstoxx")
 
-    corr_rows = []
-    for label, x, y in [
-        ("US: F1 vs sq(y10)", us_sq, us_signal),
-        ("US: F1 vs garch(y10)", us_garch, us_signal),
-        ("US: F1 vs VIX", us_vix, us_signal),
-        ("DE: F1 vs sq(y10)", de_sq, de_signal),
-        ("DE: F1 vs garch(y10)", de_garch, de_signal),
+    pd.concat([vdax, vstoxx], axis=1).to_csv(out / "de_implied_vol_monthly.csv", index_label="date")
+
+    rows_reg = []
+    rows_rank = []
+
+    for country, fac_df, proxies in [
+        ("US", us_fac, {"sq": us_sq, "garch": us_garch, "vix": us_vix}),
+        ("DE", de_fac, {"sq": de_sq, "garch": de_garch, "vdax": vdax, "vstoxx": vstoxx}),
     ]:
-        d = pd.concat([x.rename("x"), y.rename("y")], axis=1, join="inner").dropna()
-        dlag = pd.concat([x.shift(1).rename("x"), y.rename("y")], axis=1, join="inner").dropna()
-        srho, sp = spearmanr(d["x"], d["y"]) if len(d) > 20 else (np.nan, np.nan)
-        ktau, kp = kendalltau(d["x"], d["y"]) if len(d) > 20 else (np.nan, np.nan)
-        corr_rows.append(
-            {
-                "metric": label,
-                "nobs": len(d),
-                "corr_contemp": d["x"].corr(d["y"]) if len(d) else np.nan,
-                "corr_lag_vol": dlag["x"].corr(dlag["y"]) if len(dlag) else np.nan,
-                "spearman_rho": srho,
-                "spearman_p": sp,
-                "kendall_tau": ktau,
-                "kendall_p": kp,
-            }
-        )
-    corr = pd.DataFrame(corr_rows)
+        for f in fac_df.columns:
+            y = fac_df[f]
+            for pname, x in proxies.items():
+                n, b, t, p, r2 = hac_ols(y, x)
+                rows_reg.append({"country": country, "factor": f, "proxy": pname, "lag": 0, "nobs": n, "beta": b, "t": t, "p": p, "r2": r2})
 
-    reg.to_csv(out / "vol_signal_regressions.csv", index=False)
-    corr.to_csv(out / "vol_signal_correlations_and_rank.csv", index=False)
+                n, b, t, p, r2 = hac_ols(y, x.shift(1))
+                rows_reg.append({"country": country, "factor": f, "proxy": pname, "lag": 1, "nobs": n, "beta": b, "t": t, "p": p, "r2": r2})
+
+                d = pd.concat([y.rename("y"), x.rename("x")], axis=1, join="inner").dropna()
+                if len(d) >= 20:
+                    srho, sp = spearmanr(d["x"], d["y"])
+                    ktau, kp = kendalltau(d["x"], d["y"])
+                else:
+                    srho = sp = ktau = kp = np.nan
+                rows_rank.append(
+                    {
+                        "country": country,
+                        "factor": f,
+                        "proxy": pname,
+                        "nobs": len(d),
+                        "spearman_rho": srho,
+                        "spearman_p": sp,
+                        "kendall_tau": ktau,
+                        "kendall_p": kp,
+                    }
+                )
+
+    reg = pd.DataFrame(rows_reg)
+    rank = pd.DataFrame(rows_rank)
+
+    reg.to_csv(out / "vol_signal_regressions_F1_F5_with_de_implied_vol.csv", index=False)
+    rank.to_csv(out / "vol_signal_rank_tests_F1_F5_with_de_implied_vol.csv", index=False)
+
+    obs_rows = []
+    for f in us_fac.columns:
+        for pn, x in {"sq": us_sq, "garch": us_garch, "vix": us_vix}.items():
+            obs_rows.append({"country": "US", "factor": f, "proxy": pn, "nobs": len(pd.concat([us_fac[f], x], axis=1, join="inner").dropna())})
+    for f in de_fac.columns:
+        for pn, x in {"sq": de_sq, "garch": de_garch, "vdax": vdax, "vstoxx": vstoxx}.items():
+            obs_rows.append({"country": "DE", "factor": f, "proxy": pn, "nobs": len(pd.concat([de_fac[f], x], axis=1, join="inner").dropna())})
+    pd.DataFrame(obs_rows).to_csv(out / "observation_counts_F1_F5_with_de_implied_vol.csv", index=False)
+
+    # Optional: keep backward-compatible simpler exports if desired by downstream docs
+    # (using F1 rows only)
+    f1_reg = reg[(reg["factor"] == "F1") & (reg["proxy"].isin(["sq", "garch", "vix"])) & (reg["country"] == "US") | (reg["factor"] == "F1") & (reg["proxy"].isin(["sq", "garch"])) & (reg["country"] == "DE")]
+    f1_rank = rank[(rank["factor"] == "F1") & (((rank["country"] == "US") & (rank["proxy"].isin(["sq", "garch", "vix"]))) | ((rank["country"] == "DE") & (rank["proxy"].isin(["sq", "garch"]))))]
+    f1_reg.to_csv(out / "vol_signal_regressions.csv", index=False)
+    f1_rank[["country", "factor", "proxy", "nobs", "spearman_rho", "spearman_p", "kendall_tau", "kendall_p"]].to_csv(
+        out / "vol_signal_nonlinear_rank_stats.csv", index=False
+    )
 
 
 if __name__ == "__main__":
