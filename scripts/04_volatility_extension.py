@@ -31,6 +31,52 @@ def hac_ols(y: pd.Series, x: pd.Series) -> tuple[int, float, float, float, float
     return int(m.nobs), float(m.params["x"]), float(m.tvalues["x"]), float(m.pvalues["x"]), float(m.rsquared)
 
 
+def hac_joint_regression(y: pd.Series, X: pd.DataFrame, maxlags: int = 6) -> dict[str, float | int]:
+    d = pd.concat([y.rename("y"), X], axis=1, join="inner").dropna()
+    if len(d) < 40:
+        out = {"nobs": len(d), "r2": np.nan, "adj_r2": np.nan}
+        for c in X.columns:
+            out[f"b_{c}"] = np.nan
+            out[f"t_{c}"] = np.nan
+            out[f"p_{c}"] = np.nan
+        return out
+    Xc = sm.add_constant(d[X.columns], has_constant="add")
+    m = sm.OLS(d["y"], Xc).fit(cov_type="HAC", cov_kwds={"maxlags": maxlags})
+    out = {"nobs": int(m.nobs), "r2": float(m.rsquared), "adj_r2": float(m.rsquared_adj)}
+    for c in X.columns:
+        out[f"b_{c}"] = float(m.params[c])
+        out[f"t_{c}"] = float(m.tvalues[c])
+        out[f"p_{c}"] = float(m.pvalues[c])
+    return out
+
+
+def load_implied_vol(out: Path) -> tuple[pd.Series, pd.Series]:
+    cache = out / "de_implied_vol_monthly.csv"
+    if cache.exists():
+        implied = pd.read_csv(cache, parse_dates=["date"]).set_index("date").sort_index()
+        return implied["de_vdax"].rename("de_vdax"), implied["de_vstoxx"].rename("de_vstoxx")
+
+    vdax_daily = investpy.get_index_historical_data(
+        index="VDAX New", country="germany", from_date="01/01/2000", to_date="31/12/2022"
+    )
+    vdax = vdax_daily["Close"].astype(float)
+    vdax.index = pd.to_datetime(vdax.index)
+    vdax = vdax.resample("ME").mean().rename("de_vdax")
+
+    vstoxx_daily = investpy.get_index_historical_data(
+        index="STOXX 50 Volatility VSTOXX EUR",
+        country="euro zone",
+        from_date="01/01/2000",
+        to_date="31/12/2022",
+    )
+    vstoxx = vstoxx_daily["Close"].astype(float)
+    vstoxx.index = pd.to_datetime(vstoxx.index)
+    vstoxx = vstoxx.resample("ME").mean().rename("de_vstoxx")
+
+    pd.concat([vdax, vstoxx], axis=1).to_csv(cache, index_label="date")
+    return vdax, vstoxx
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     out = root / "data" / "processed" / "volatility_extension"
@@ -71,24 +117,7 @@ def main() -> None:
     us_vix = fred_series("VIXCLS", "mean").rename("us_vix")
 
     # Germany / Euro implied vol proxies
-    vdax_daily = investpy.get_index_historical_data(
-        index="VDAX New", country="germany", from_date="01/01/2000", to_date="31/12/2022"
-    )
-    vdax = vdax_daily["Close"].astype(float)
-    vdax.index = pd.to_datetime(vdax.index)
-    vdax = vdax.resample("ME").mean().rename("de_vdax")
-
-    vstoxx_daily = investpy.get_index_historical_data(
-        index="STOXX 50 Volatility VSTOXX EUR",
-        country="euro zone",
-        from_date="01/01/2000",
-        to_date="31/12/2022",
-    )
-    vstoxx = vstoxx_daily["Close"].astype(float)
-    vstoxx.index = pd.to_datetime(vstoxx.index)
-    vstoxx = vstoxx.resample("ME").mean().rename("de_vstoxx")
-
-    pd.concat([vdax, vstoxx], axis=1).to_csv(out / "de_implied_vol_monthly.csv", index_label="date")
+    vdax, vstoxx = load_implied_vol(out)
 
     rows_reg = []
     rows_rank = []
@@ -139,6 +168,19 @@ def main() -> None:
         for pn, x in {"sq": de_sq, "garch": de_garch, "vdax": vdax, "vstoxx": vstoxx}.items():
             obs_rows.append({"country": "DE", "factor": f, "proxy": pn, "nobs": len(pd.concat([de_fac[f], x], axis=1, join="inner").dropna())})
     pd.DataFrame(obs_rows).to_csv(out / "observation_counts_F1_F5_with_de_implied_vol.csv", index=False)
+
+    horizons = [0, 1, 3, 6, 12]
+    joint_rows: list[dict[str, float | int | str]] = []
+    for country, X, proxies in [
+        ("US", us_fac, {"sq": us_sq, "garch": us_garch, "vix": us_vix}),
+        ("DE", de_fac, {"sq": de_sq, "garch": de_garch, "vdax": vdax.rename("vdax"), "vstoxx": vstoxx.rename("vstoxx")}),
+    ]:
+        for proxy_name, proxy in proxies.items():
+            for h in horizons:
+                y = proxy if h == 0 else proxy.shift(-h)
+                res = hac_joint_regression(y, X)
+                joint_rows.append({"country": country, "proxy": proxy_name, "horizon_m": h, **res})
+    pd.DataFrame(joint_rows).to_csv(out / "multifactor_proxy_regressions_horizons.csv", index=False)
 
     # Optional: keep backward-compatible simpler exports if desired by downstream docs
     # (using F1 rows only)
