@@ -77,6 +77,14 @@ def load_implied_vol(out: Path) -> tuple[pd.Series, pd.Series]:
     return vdax, vstoxx
 
 
+def standardize_series(s: pd.Series) -> pd.Series:
+    mu = s.mean(skipna=True)
+    sd = s.std(skipna=True, ddof=1)
+    if pd.isna(sd) or sd == 0:
+        return s * np.nan
+    return (s - mu) / sd
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     out = root / "data" / "processed" / "volatility_extension"
@@ -181,6 +189,64 @@ def main() -> None:
                 res = hac_joint_regression(y, X)
                 joint_rows.append({"country": country, "proxy": proxy_name, "horizon_m": h, **res})
     pd.DataFrame(joint_rows).to_csv(out / "multifactor_proxy_regressions_horizons.csv", index=False)
+
+    # Standardized-proxy versions for comparability checks.
+    us_sq_z = standardize_series(us_sq).rename("us_sq")
+    us_garch_z = standardize_series(us_garch).rename("us_garch")
+    us_vix_z = standardize_series(us_vix).rename("us_vix")
+    de_sq_z = standardize_series(de_sq).rename("de_sq")
+    de_garch_z = standardize_series(de_garch).rename("de_garch")
+    vdax_z = standardize_series(vdax).rename("de_vdax")
+    vstoxx_z = standardize_series(vstoxx).rename("de_vstoxx")
+
+    rows_reg_std = []
+    rows_rank_std = []
+    for country, fac_df, proxies in [
+        ("US", us_fac, {"sq": us_sq_z, "garch": us_garch_z, "vix": us_vix_z}),
+        ("DE", de_fac, {"sq": de_sq_z, "garch": de_garch_z, "vdax": vdax_z, "vstoxx": vstoxx_z}),
+    ]:
+        for f in fac_df.columns:
+            y = fac_df[f]
+            for pname, x in proxies.items():
+                n, b, t, p, r2 = hac_ols(y, x)
+                rows_reg_std.append({"country": country, "factor": f, "proxy": pname, "lag": 0, "nobs": n, "beta": b, "t": t, "p": p, "r2": r2})
+
+                n, b, t, p, r2 = hac_ols(y, x.shift(1))
+                rows_reg_std.append({"country": country, "factor": f, "proxy": pname, "lag": 1, "nobs": n, "beta": b, "t": t, "p": p, "r2": r2})
+
+                d = pd.concat([y.rename("y"), x.rename("x")], axis=1, join="inner").dropna()
+                if len(d) >= 20:
+                    srho, sp = spearmanr(d["x"], d["y"])
+                    ktau, kp = kendalltau(d["x"], d["y"])
+                else:
+                    srho = sp = ktau = kp = np.nan
+                rows_rank_std.append(
+                    {
+                        "country": country,
+                        "factor": f,
+                        "proxy": pname,
+                        "nobs": len(d),
+                        "spearman_rho": srho,
+                        "spearman_p": sp,
+                        "kendall_tau": ktau,
+                        "kendall_p": kp,
+                    }
+                )
+
+    pd.DataFrame(rows_reg_std).to_csv(out / "vol_signal_regressions_F1_F5_with_de_implied_vol_std_proxies.csv", index=False)
+    pd.DataFrame(rows_rank_std).to_csv(out / "vol_signal_rank_tests_F1_F5_with_de_implied_vol_std_proxies.csv", index=False)
+
+    joint_rows_std: list[dict[str, float | int | str]] = []
+    for country, X, proxies in [
+        ("US", us_fac, {"sq": us_sq_z, "garch": us_garch_z, "vix": us_vix_z}),
+        ("DE", de_fac, {"sq": de_sq_z, "garch": de_garch_z, "vdax": vdax_z.rename("vdax"), "vstoxx": vstoxx_z.rename("vstoxx")}),
+    ]:
+        for proxy_name, proxy in proxies.items():
+            for h in horizons:
+                y = proxy if h == 0 else proxy.shift(-h)
+                res = hac_joint_regression(y, X)
+                joint_rows_std.append({"country": country, "proxy": proxy_name, "horizon_m": h, **res})
+    pd.DataFrame(joint_rows_std).to_csv(out / "multifactor_proxy_regressions_horizons_std_proxies.csv", index=False)
 
     # Optional: keep backward-compatible simpler exports if desired by downstream docs
     # (using F1 rows only)
